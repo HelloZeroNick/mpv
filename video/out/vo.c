@@ -47,6 +47,9 @@
 #include "osdep/threads.h"
 
 extern const struct vo_driver video_out_mediacodec_embed;
+#if HAVE_OHOS
+extern const struct vo_driver video_out_ohcodec_embed;
+#endif
 extern const struct vo_driver video_out_x11;
 extern const struct vo_driver video_out_vdpau;
 extern const struct vo_driver video_out_xv;
@@ -87,6 +90,9 @@ static const struct vo_driver *const video_out_drivers[] =
 #endif
 #if HAVE_ANDROID
     &video_out_mediacodec_embed,
+#endif
+#if HAVE_OHOS
+    &video_out_ohcodec_embed,
 #endif
 #if HAVE_SDL2_VIDEO
     &video_out_sdl,

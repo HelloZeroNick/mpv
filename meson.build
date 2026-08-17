@@ -488,6 +488,7 @@ if features['ohos']
                      cc.find_library('native_window')]
     sources += files('audio/out/ao_ohaudio.c',
                      'video/out/ohos_common.c',
+                     'video/out/vo_ohcodec_embed.c',
                      'video/out/hwdec/hwdec_ohcodec.c')
 endif
 
