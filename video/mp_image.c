@@ -27,6 +27,7 @@
 #include <libavutil/intreadwrite.h>
 #include <libavutil/rational.h>
 #include <libavcodec/avcodec.h>
+#include <libavutil/hdr_dynamic_vivid_metadata.h>
 #include <libavutil/mastering_display_metadata.h>
 #include <libplacebo/utils/libav.h>
 
@@ -1209,6 +1210,28 @@ struct mp_image *mp_image_from_av_frame(struct AVFrame *src)
     if (sd) {
         pl_hdr_metadata_from_dovi_rpu(&dst->params.color.hdr, sd->buf->data,
                                       sd->buf->size);
+    }
+
+    // HDR Vivid (CUVA) dynamic metadata. libplacebo has no CUVA support, but
+    // its CIE_Y channel takes exactly the quantity HDR Vivid carries: a PQ
+    // domain 0-1 luminance. maximum_maxrgb/average_maxrgb are 12 bit values
+    // over a denominator of 4095, so av_q2d() already yields the field's unit
+    // (scene_max[] would be wrong here, it is documented as cd/m2). Dolby
+    // Vision L1 rides the same field via pl_hdr_metadata_from_dovi_rpu()
+    // above, so it keeps precedence on a stream carrying both.
+    sd = av_frame_get_side_data(src, AV_FRAME_DATA_DYNAMIC_HDR_VIVID);
+    if (sd && !dst->params.color.hdr.max_pq_y) {
+        const AVDynamicHDRVivid *vivid = (const AVDynamicHDRVivid *)sd->data;
+        if (vivid->num_windows >= 1) {
+            double max_pq_y = av_q2d(vivid->params[0].maximum_maxrgb);
+            double avg_pq_y = av_q2d(vivid->params[0].average_maxrgb);
+            // pl_hdr_metadata_contains(PL_HDR_METADATA_CIE_Y) needs both to be
+            // non-zero, so publish them as a pair or not at all.
+            if (max_pq_y > 0 && avg_pq_y > 0) {
+                dst->params.color.hdr.max_pq_y = max_pq_y;
+                dst->params.color.hdr.avg_pq_y = avg_pq_y;
+            }
+        }
     }
 
     sd = av_frame_get_side_data(src, AV_FRAME_DATA_FILM_GRAIN_PARAMS);
