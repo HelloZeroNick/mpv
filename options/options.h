@@ -88,6 +88,8 @@ typedef struct mp_vo_opts {
 
     struct m_geometry ohos_surface_size;
 
+    int ohos_hdr_mode;
+
     struct m_geometry d3d11_composition_size;
 
     int swapchain_depth;  // max number of images to render ahead

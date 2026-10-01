@@ -44,6 +44,9 @@
 #include "video/csputils.h"
 #include "video/filter/refqueue.h"
 #include "video/hwdec.h"
+#if HAVE_OHOS
+#include "video/out/ohos_common.h"
+#endif
 #include "video/image_writer.h"
 #include "sub/osd.h"
 #include "sub/sd.h"
@@ -247,6 +250,14 @@ static const m_option_t mp_vo_opt_list[] = {
 #endif
 #if HAVE_EGL_OHOS
     {"ohos-surface-size", OPT_SIZE_BOX(ohos_surface_size)},
+#endif
+#if HAVE_OHOS
+    {"ohos-hdr-mode", OPT_CHOICE(ohos_hdr_mode,
+        {"auto", OHOS_HDR_MODE_AUTO},
+        {"no", OHOS_HDR_MODE_OFF},
+        {"hdr10", OHOS_HDR_MODE_HDR10},
+        {"hlg", OHOS_HDR_MODE_HLG},
+        {"vivid", OHOS_HDR_MODE_VIVID})},
 #endif
 #if HAVE_D3D11
     {"d3d11-composition-size", OPT_SIZE_BOX(d3d11_composition_size)},

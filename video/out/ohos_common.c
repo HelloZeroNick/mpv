@@ -15,6 +15,8 @@
  * License along with mpv.  If not, see <http://www.gnu.org/licenses/>.
  */
 
+#include <libavutil/frame.h>
+
 #include "ohos_common.h"
 #include "common/msg.h"
 #include "video/mp_image.h"
@@ -30,6 +32,8 @@ struct vo_ohos_state {
     bool static_metadata_valid;
     bool hdr_brightness_valid;
     float hdr_brightness;
+    // True when the decoded stream carried HDR Vivid (CUVA) metadata.
+    bool source_is_vivid;
 };
 
 static bool is_hdr(const struct pl_color_space *color)
@@ -76,17 +80,48 @@ static OH_NativeBuffer_StaticMetadata get_static_metadata(
     };
 }
 
-static void set_output_color(struct vo_ohos_state *ctx,
-                             struct pl_color_space color)
+// Decides which metadata type to advertise on the NativeWindow. HarmonyOS
+// only ramps the panel to peak brightness when this is one of the HDR values,
+// so it must reflect what is actually being pushed into the surface.
+static OH_NativeBuffer_MetadataType resolve_metadata_type(
+    struct vo *vo, const struct pl_color_space *color, bool hdr)
 {
+    // Announcing an HDR type while the surface holds an SDR buffer would tell
+    // the compositor to expect PQ/HLG content that is not there, so the
+    // forced modes below only apply once the output really is HDR.
+    if (!hdr)
+        return OH_VIDEO_NONE;
+
+    switch (vo->opts->ohos_hdr_mode) {
+    case OHOS_HDR_MODE_HDR10:
+        return OH_VIDEO_HDR_HDR10;
+    case OHOS_HDR_MODE_HLG:
+        return OH_VIDEO_HDR_HLG;
+    case OHOS_HDR_MODE_VIVID:
+        // Used to map Dolby Vision onto HDR Vivid: libplacebo has already
+        // applied the DV RPU, so the surface carries a finished PQ image and
+        // only the signalling differs.
+        return OH_VIDEO_HDR_VIVID;
+    default:
+        break;
+    }
+
+    if (vo->ohos->source_is_vivid)
+        return OH_VIDEO_HDR_VIVID;
+    return color->transfer == PL_COLOR_TRC_HLG ? OH_VIDEO_HDR_HLG
+                                               : OH_VIDEO_HDR_HDR10;
+}
+
+static void set_output_color(struct vo *vo, struct pl_color_space color)
+{
+    struct vo_ohos_state *ctx = vo->ohos;
+
     pl_color_space_infer(&color);
 
     bool hdr = is_hdr(&color);
     OH_NativeBuffer_ColorSpace color_space = get_color_space(&color);
-    OH_NativeBuffer_MetadataType metadata_type = hdr
-        ? (color.transfer == PL_COLOR_TRC_HLG ? OH_VIDEO_HDR_HLG
-                                              : OH_VIDEO_HDR_HDR10)
-        : OH_VIDEO_NONE;
+    OH_NativeBuffer_MetadataType metadata_type =
+        resolve_metadata_type(vo, &color, hdr);
     float hdr_brightness = hdr ? 1.0f : 0.0f;
 
     if (!ctx->color_space_valid || ctx->color_space != color_space) {
@@ -227,7 +262,11 @@ bool vo_ohos_set_color(struct vo *vo, struct mp_image_params *params)
     struct pl_color_space color = params ? params->color
                                          : pl_color_space_srgb;
 
-    if (is_hdr(&color)) {
+    // --ohos-hdr-mode=no keeps the surface in SDR, which makes libplacebo tone
+    // map the stream down instead of handing PQ/HLG to the compositor.
+    bool allow_hdr = vo->opts->ohos_hdr_mode != OHOS_HDR_MODE_OFF;
+
+    if (allow_hdr && is_hdr(&color)) {
         color.primaries = PL_COLOR_PRIM_BT_2020;
         pl_color_space_infer(&color);
     } else {
@@ -243,8 +282,48 @@ bool vo_ohos_set_color(struct vo *vo, struct mp_image_params *params)
         if (source.transfer == color.transfer)
             window_color.hdr = source.hdr;
     }
-    set_output_color(vo->ohos, window_color);
+    set_output_color(vo, window_color);
     return true;
+}
+
+void vo_ohos_set_frame(struct vo *vo, struct mp_image *mpi)
+{
+    struct vo_ohos_state *ctx = vo->ohos;
+    if (!ctx)
+        return;
+
+    bool was_vivid = ctx->source_is_vivid;
+    ctx->source_is_vivid = false;
+
+    for (int n = 0; mpi && n < mpi->num_ff_side_data; n++) {
+        struct mp_ff_side_data *sd = &mpi->ff_side_data[n];
+        if (!sd->buf)
+            continue;
+
+        if (sd->type == AV_FRAME_DATA_DYNAMIC_HDR_VIVID) {
+            // Only the presence is recorded, never the payload. FFmpeg parses
+            // CUVA but cannot serialise it back: there is no
+            // av_dynamic_hdr_vivid_to_t35, here or upstream, and the raw T.35
+            // bytes are destroyed at SEI parse time. So the payload
+            // OH_HDR_DYNAMIC_METADATA wants cannot be reconstructed. Knowing
+            // the source was Vivid still lets us advertise the right type.
+            //
+            // Forwarding HDR10+ in its place is not a substitute, and was
+            // removed for being actively harmful: OHOS has no ST 2094-40
+            // metadata type, so those bytes could only be sent under
+            // OH_VIDEO_HDR_VIVID, which means a CUVA payload. A CUVA parser
+            // validates only system_start_code in 0x01..0x07, while
+            // av_dynamic_hdr_plus_to_t35 emits a headerless payload starting
+            // with application_version = 0x01 — so it is accepted and
+            // silently misparsed into garbage tone-curve parameters rather
+            // than rejected.
+            ctx->source_is_vivid = true;
+        }
+    }
+
+    // The advertised metadata type depends on this, so force it to be resent.
+    if (was_vivid != ctx->source_is_vivid)
+        ctx->metadata_type_valid = false;
 }
 
 void vo_ohos_invalidate_color(struct vo *vo)

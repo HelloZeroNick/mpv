@@ -24,7 +24,20 @@
 #include "common/common.h"
 
 struct vo;
+struct mp_image;
 struct mp_image_params;
+
+// Values of --ohos-hdr-mode. "auto" derives the HDR signalling from the
+// stream; the remaining values force a specific NativeWindow metadata type.
+// Forcing is mainly useful for Dolby Vision, which HarmonyOS does not signal
+// natively: the player can map it onto HDR Vivid (or plain HDR10) instead.
+enum ohos_hdr_mode {
+    OHOS_HDR_MODE_AUTO = 0,
+    OHOS_HDR_MODE_OFF,
+    OHOS_HDR_MODE_HDR10,
+    OHOS_HDR_MODE_HLG,
+    OHOS_HDR_MODE_VIVID,
+};
 
 bool vo_ohos_init(struct vo *vo);
 void vo_ohos_uninit(struct vo *vo);
@@ -33,3 +46,8 @@ bool vo_ohos_surface_size(struct vo *vo, int *w, int *h);
 struct pl_color_space vo_ohos_preferred_csp(struct vo *vo);
 bool vo_ohos_set_color(struct vo *vo, struct mp_image_params *params);
 void vo_ohos_invalidate_color(struct vo *vo);
+
+// Picks up per-frame dynamic HDR metadata (HDR Vivid / HDR10+) so that the
+// next vo_ohos_set_color() can forward it to the NativeWindow. Safe to call
+// with a NULL image; only the metadata payload is retained here.
+void vo_ohos_set_frame(struct vo *vo, struct mp_image *mpi);

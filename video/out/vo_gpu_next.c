@@ -49,6 +49,10 @@
 #include "sub/osd.h"
 #include "gpu_next/context.h"
 
+#if HAVE_OHOS
+#include "ohos_common.h"
+#endif
+
 #if HAVE_GL && defined(PL_HAVE_OPENGL)
 #include <libplacebo/opengl.h>
 #include "video/out/opengl/ra_gl.h"
@@ -1149,6 +1153,11 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
         target_csp = (struct pl_color_space){
             .transfer = opts->target_trc ? opts->target_trc : pl_color_space_hdr10.transfer };
     }
+#if HAVE_OHOS
+    // Pick up HDR Vivid / HDR10+ side data before the colorspace hint is
+    // resolved, so the NativeWindow can be told which HDR flavour it carries.
+    vo_ohos_set_frame(vo, frame->current);
+#endif
     if (target_hint && frame->current) {
         const struct pl_color_space *source = &frame->current->params.color;
         const struct pl_color_space *target = &target_csp;
