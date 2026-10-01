@@ -117,6 +117,22 @@ static bool ohos_reconfig(struct ra_ctx *ctx)
     if (!vo_ohos_surface_size(ctx->vo, &w, &h))
         return false;
 
+    // Mirror context_android's ANativeWindow_setBuffersGeometry(): we are about
+    // to render at w x h, so the producer buffer has to actually be that size.
+    // external_window.h documents SET_BUFFER_GEOMETRY as a prerequisite for
+    // producing buffers, and nothing else on this path establishes it -- the
+    // Flutter texture is sized asynchronously by the embedder, and pinning
+    // --ohos-surface-size keeps vo_ohos_surface_size() from ever reading the
+    // real geometry back. Without this mpv renders at one size into a buffer of
+    // another, and the compositor rescales it per axis: a distorted picture.
+    // Mind the argument order -- SET takes (width, height), while the GET in
+    // vo_ohos_surface_size() returns (height, width).
+    OHNativeWindow *native_window = vo_ohos_native_window(ctx->vo);
+    if (native_window) {
+        OH_NativeWindow_NativeWindowHandleOpt(native_window,
+                                              SET_BUFFER_GEOMETRY, w, h);
+    }
+
     ctx->vo->dwidth = w;
     ctx->vo->dheight = h;
     ra_gl_ctx_resize(ctx->swapchain, w, h, 0);
