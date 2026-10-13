@@ -15,9 +15,14 @@
  * License along with mpv.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-#include <libavutil/frame.h>
+#include <math.h>
+#include <stdio.h>
+#include <string.h>
+
+#include <libplacebo/tone_mapping.h>
 
 #include "ohos_common.h"
+#include "ohos_hdr_vivid.h"
 #include "common/msg.h"
 #include "video/mp_image.h"
 #include "vo.h"
@@ -25,15 +30,35 @@
 struct vo_ohos_state {
     struct mp_log *log;
     OHNativeWindow *native_window;
+
+    // The frame being drawn, captured by vo_ohos_set_frame(), with the
+    // dynamic metadata of its stream.
+    struct mp_image_params source;
+    const struct pl_color_map_params *color_map;
+    struct ohos_vivid_tracker vivid;
+    // The tone mapping from the frame to the current render target.
+    struct pl_tone_map_params tone;
+    // The stream's Dolby Vision RPU as last logged, see log_dovi().
+    char dovi_desc[128];
+
+    // What the NativeWindow was last told, so that only changes are sent.
     bool color_space_valid;
     OH_NativeBuffer_ColorSpace color_space;
     bool metadata_type_valid;
     OH_NativeBuffer_MetadataType metadata_type;
     bool static_metadata_valid;
+    OH_NativeBuffer_StaticMetadata static_metadata;
+    uint8_t dynamic_metadata[OHOS_VIVID_MAX_SIZE];
+    size_t dynamic_metadata_size;
     bool hdr_brightness_valid;
     float hdr_brightness;
-    // True when the decoded stream carried HDR Vivid (CUVA) metadata.
-    bool source_is_vivid;
+};
+
+static const char *const dynamic_names[] = {
+    [OHOS_DYNAMIC_HDR_NONE]  = "none",
+    [OHOS_DYNAMIC_HDR_DOVI]  = "Dolby Vision",
+    [OHOS_DYNAMIC_HDR_VIVID] = "HDR Vivid",
+    [OHOS_DYNAMIC_HDR_PLUS]  = "HDR10+",
 };
 
 static bool is_hdr(const struct pl_color_space *color)
@@ -52,131 +77,222 @@ static OH_NativeBuffer_ColorSpace get_color_space(
     return OH_COLORSPACE_DISPLAY_SRGB;
 }
 
+static const char *metadata_type_name(OH_NativeBuffer_MetadataType type)
+{
+    switch (type) {
+    case OH_VIDEO_HDR_HLG:   return "HLG";
+    case OH_VIDEO_HDR_HDR10: return "HDR10";
+    case OH_VIDEO_HDR_VIVID: return "HDR Vivid";
+    default:                 return "none";
+    }
+}
+
+// The window's colour space is a fully inferred render target, so this is
+// exactly the output: the source's own metadata when it passes through
+// untouched, the target luminance when libplacebo tone maps it down.
+//
+// The render service sizes the layer's HDR brightness from MaxCLL, so it is
+// never left at 0 (which grants no headroom at all): without a content light
+// level the peak stands in, as libplacebo itself assumes.
 static OH_NativeBuffer_StaticMetadata get_static_metadata(
     const struct pl_color_space *color)
 {
-    struct pl_raw_primaries prim = color->hdr.prim;
-    if (!pl_primaries_valid(&prim)) {
-        const struct pl_raw_primaries *container =
-            pl_raw_primaries_get(color->primaries);
-        if (!container)
-            container = pl_raw_primaries_get(PL_COLOR_PRIM_BT_2020);
-        prim = *container;
-    }
-
+    const struct pl_raw_primaries *prim = &color->hdr.prim;
+    float max_cll = color->hdr.max_cll ? color->hdr.max_cll
+                                       : color->hdr.max_luma;
     return (OH_NativeBuffer_StaticMetadata){
         .smpte2086 = {
-            .displayPrimaryRed = {prim.red.x, prim.red.y},
-            .displayPrimaryGreen = {prim.green.x, prim.green.y},
-            .displayPrimaryBlue = {prim.blue.x, prim.blue.y},
-            .whitePoint = {prim.white.x, prim.white.y},
+            .displayPrimaryRed = {prim->red.x, prim->red.y},
+            .displayPrimaryGreen = {prim->green.x, prim->green.y},
+            .displayPrimaryBlue = {prim->blue.x, prim->blue.y},
+            .whitePoint = {prim->white.x, prim->white.y},
             .maxLuminance = color->hdr.max_luma,
             .minLuminance = color->hdr.min_luma,
         },
         .cta861 = {
-            .maxContentLightLevel = color->hdr.max_cll,
-            .maxFrameAverageLightLevel = color->hdr.max_fall,
+            .maxContentLightLevel = max_cll,
+            .maxFrameAverageLightLevel = color->hdr.max_fall <= max_cll
+                                             ? color->hdr.max_fall : 0,
         },
     };
 }
 
-// Decides which metadata type to advertise on the NativeWindow. HarmonyOS
-// only ramps the panel to peak brightness when this is one of the HDR values,
-// so it must reflect what is actually being pushed into the surface.
-static OH_NativeBuffer_MetadataType resolve_metadata_type(
-    struct vo *vo, const struct pl_color_space *color, bool hdr)
+// HarmonyOS only ramps the panel to its HDR brightness for the HDR types, and
+// HDR Vivid is its only format with dynamic metadata: Dolby Vision and HDR10+
+// travel in it too, their metadata converted.
+static OH_NativeBuffer_MetadataType get_metadata_type(
+    struct vo *vo, const struct pl_color_space *color)
 {
-    // Announcing an HDR type while the surface holds an SDR buffer would tell
-    // the compositor to expect PQ/HLG content that is not there, so the
-    // forced modes below only apply once the output really is HDR.
-    if (!hdr)
+    if (!is_hdr(color))
         return OH_VIDEO_NONE;
-
-    switch (vo->opts->ohos_hdr_mode) {
-    case OHOS_HDR_MODE_HDR10:
-        return OH_VIDEO_HDR_HDR10;
-    case OHOS_HDR_MODE_HLG:
-        return OH_VIDEO_HDR_HLG;
-    case OHOS_HDR_MODE_VIVID:
-        // Used to map Dolby Vision onto HDR Vivid: libplacebo has already
-        // applied the DV RPU, so the surface carries a finished PQ image and
-        // only the signalling differs.
-        return OH_VIDEO_HDR_VIVID;
-    default:
-        break;
-    }
-
-    if (vo->ohos->source_is_vivid)
+    if (vo->ohos->vivid.dynamic != OHOS_DYNAMIC_HDR_NONE &&
+        vo->opts->ohos_hdr_mode == OHOS_HDR_MODE_AUTO)
         return OH_VIDEO_HDR_VIVID;
     return color->transfer == PL_COLOR_TRC_HLG ? OH_VIDEO_HDR_HLG
                                                : OH_VIDEO_HDR_HDR10;
 }
 
-static void set_output_color(struct vo *vo, struct pl_color_space color)
+// HDR Vivid metadata describing the picture as it leaves the renderer. A
+// stream that passes through untouched keeps its own (curve parameters
+// included); otherwise it is described by its statistics, mapped through the
+// tone curve when libplacebo compresses it into the target.
+//
+// A surface keeps the last dynamic metadata it was given (it cannot be
+// cleared), so an HDR10 picture gets one matching its static metadata, in
+// place of whatever an earlier HDR Vivid picture left behind.
+static size_t get_dynamic_metadata(struct vo_ohos_state *ctx,
+                                   OH_NativeBuffer_MetadataType type,
+                                   const struct pl_color_space *target,
+                                   uint8_t *buf, size_t size)
+{
+    const struct ohos_vivid_tracker *vivid = &ctx->vivid;
+    struct ohos_vivid_stats stats;
+    if (type == OH_VIDEO_HDR_VIVID) {
+        if (vivid->native_size && pl_tone_map_params_noop(&ctx->tone)) {
+            memcpy(buf, vivid->native, vivid->native_size);
+            return vivid->native_size;
+        }
+        stats = vivid->stats;
+        ohos_vivid_tone_map(&stats, &ctx->tone);
+    } else {
+        ohos_vivid_stats_from_static(&stats, &target->hdr);
+    }
+
+    AVDynamicHDRVivid md;
+    ohos_vivid_from_stats(&md, &stats);
+    return ohos_vivid_write(&md, buf, size);
+}
+
+static void log_dynamic_metadata(struct vo_ohos_state *ctx,
+                                 const uint8_t *md, size_t size)
+{
+    const struct ohos_vivid_tracker *vivid = &ctx->vivid;
+    // The four 12 bit statistics following the 8 bit system_start_code, which
+    // any payload (8 bytes at least) holds.
+    int min = md[1] << 4 | md[2] >> 4;
+    int avg = (md[2] & 0xf) << 8 | md[3];
+    int var = md[4] << 4 | md[5] >> 4;
+    int max = (md[5] & 0xf) << 8 | md[6];
+    // When libplacebo compresses the picture, the average and peak it tone
+    // maps by as well: which luminance (Dolby Vision level 1 with level 3,
+    // say) reached the tone curve.
+    char tone[64] = "";
+    if (!pl_tone_map_params_noop(&ctx->tone)) {
+        snprintf(tone, sizeof(tone), ", tone mapped from avg %ld max %ld",
+                 lrintf(ctx->tone.input_avg * 4095),
+                 lrintf(ctx->tone.input_max * 4095));
+    }
+    MP_DBG(ctx, "HDR Vivid metadata (%s%s): maxRGB min %d avg %d var %d max %d "
+           "of 4095, %zu bytes%s\n", dynamic_names[vivid->dynamic],
+           size == vivid->native_size && !memcmp(md, vivid->native, size)
+               ? ", native" : "",
+           min, avg, var, max, size, tone);
+}
+
+static bool set_window_metadata(struct vo_ohos_state *ctx,
+                                OH_NativeBuffer_MetadataKey key,
+                                const void *value, size_t size,
+                                const char *name)
+{
+    int ret = OH_NativeWindow_SetMetadataValue(ctx->native_window, key, size,
+                                               (uint8_t *)value);
+    if (ret)
+        MP_WARN(ctx, "Failed to set NativeWindow %s: %d\n", name, ret);
+    return !ret;
+}
+
+static void send_static_metadata(struct vo_ohos_state *ctx,
+                                 const struct pl_color_space *color)
+{
+    if (!is_hdr(color)) {
+        ctx->static_metadata_valid = false;
+        return;
+    }
+
+    OH_NativeBuffer_StaticMetadata md = get_static_metadata(color);
+    if (ctx->static_metadata_valid &&
+        !memcmp(&md, &ctx->static_metadata, sizeof(md)))
+        return;
+
+    ctx->static_metadata = md;
+    ctx->static_metadata_valid = set_window_metadata(ctx,
+        OH_HDR_STATIC_METADATA, &md, sizeof(md), "HDR static metadata");
+    const OH_NativeBuffer_Smpte2086 *m = &md.smpte2086;
+    MP_VERBOSE(ctx, "NativeWindow HDR static metadata: mastering "
+               "%.4f-%.0f nits, MaxCLL %.0f, MaxFALL %.0f, primaries "
+               "R %.4f,%.4f G %.4f,%.4f B %.4f,%.4f W %.4f,%.4f\n",
+               m->minLuminance, m->maxLuminance,
+               md.cta861.maxContentLightLevel,
+               md.cta861.maxFrameAverageLightLevel,
+               m->displayPrimaryRed.x, m->displayPrimaryRed.y,
+               m->displayPrimaryGreen.x, m->displayPrimaryGreen.y,
+               m->displayPrimaryBlue.x, m->displayPrimaryBlue.y,
+               m->whitePoint.x, m->whitePoint.y);
+}
+
+static void send_dynamic_metadata(struct vo_ohos_state *ctx,
+                                  OH_NativeBuffer_MetadataType type,
+                                  const struct pl_color_space *color)
+{
+    // HLG and SDR carry none.
+    if (type != OH_VIDEO_HDR_VIVID && type != OH_VIDEO_HDR_HDR10)
+        return;
+
+    uint8_t md[OHOS_VIVID_MAX_SIZE];
+    size_t size = get_dynamic_metadata(ctx, type, color, md, sizeof(md));
+    if (!size || (size == ctx->dynamic_metadata_size &&
+                  !memcmp(md, ctx->dynamic_metadata, size)))
+        return;
+    if (!set_window_metadata(ctx, OH_HDR_DYNAMIC_METADATA, md, size,
+                             "HDR dynamic metadata"))
+        return;
+
+    memcpy(ctx->dynamic_metadata, md, size);
+    ctx->dynamic_metadata_size = size;
+    log_dynamic_metadata(ctx, md, size);
+}
+
+static void update_window(struct vo *vo, const struct pl_color_space *color)
 {
     struct vo_ohos_state *ctx = vo->ohos;
+    bool hdr = is_hdr(color);
 
-    pl_color_space_infer(&color);
-
-    bool hdr = is_hdr(&color);
-    OH_NativeBuffer_ColorSpace color_space = get_color_space(&color);
-    OH_NativeBuffer_MetadataType metadata_type =
-        resolve_metadata_type(vo, &color, hdr);
-    float hdr_brightness = hdr ? 1.0f : 0.0f;
-
+    OH_NativeBuffer_ColorSpace color_space = get_color_space(color);
     if (!ctx->color_space_valid || ctx->color_space != color_space) {
         int ret = OH_NativeWindow_SetColorSpace(ctx->native_window, color_space);
-        if (ret == 0) {
-            ctx->color_space = color_space;
-            ctx->color_space_valid = true;
-            MP_VERBOSE(ctx, "NativeWindow output switched to %s\n",
-                       hdr ? (color.transfer == PL_COLOR_TRC_HLG
-                                  ? "BT.2020 HLG" : "BT.2020 PQ")
-                           : "sRGB");
-        } else {
+        ctx->color_space = color_space;
+        ctx->color_space_valid = !ret;
+        if (ret) {
             MP_WARN(ctx, "Failed to set NativeWindow color space: %d\n", ret);
-        }
-    }
-
-    bool metadata_type_changed = !ctx->metadata_type_valid ||
-                                 ctx->metadata_type != metadata_type;
-    if (metadata_type_changed) {
-        int ret = OH_NativeWindow_SetMetadataValue(
-            ctx->native_window, OH_HDR_METADATA_TYPE, sizeof(metadata_type),
-            (uint8_t *)&metadata_type);
-        if (ret == 0) {
-            ctx->metadata_type = metadata_type;
-            ctx->metadata_type_valid = true;
         } else {
-            MP_WARN(ctx, "Failed to set NativeWindow HDR metadata type: %d\n",
-                    ret);
+            MP_VERBOSE(ctx, "NativeWindow output switched to %s\n",
+                       !hdr ? "sRGB" : color->transfer == PL_COLOR_TRC_HLG
+                                           ? "BT.2020 HLG" : "BT.2020 PQ");
         }
     }
 
-    if (hdr && (metadata_type_changed || !ctx->static_metadata_valid)) {
-        OH_NativeBuffer_StaticMetadata metadata = get_static_metadata(&color);
-        int ret = OH_NativeWindow_SetMetadataValue(
-            ctx->native_window, OH_HDR_STATIC_METADATA, sizeof(metadata),
-            (uint8_t *)&metadata);
-        if (ret == 0) {
-            ctx->static_metadata_valid = true;
-        } else {
-            MP_WARN(ctx, "Failed to set NativeWindow HDR static metadata: %d\n",
-                    ret);
-        }
-    } else if (!hdr) {
-        ctx->static_metadata_valid = false;
+    OH_NativeBuffer_MetadataType type = get_metadata_type(vo, color);
+    if (!ctx->metadata_type_valid || ctx->metadata_type != type) {
+        ctx->metadata_type = type;
+        ctx->metadata_type_valid = set_window_metadata(ctx,
+            OH_HDR_METADATA_TYPE, &type, sizeof(type), "HDR metadata type");
+        // The dynamic metadata is tied to the type; send it afresh.
+        ctx->dynamic_metadata_size = 0;
+        MP_VERBOSE(ctx, "NativeWindow HDR type %s (dynamic metadata: %s)\n",
+                   metadata_type_name(type), dynamic_names[ctx->vivid.dynamic]);
     }
 
+    send_static_metadata(ctx, color);
+    send_dynamic_metadata(ctx, type, color);
+
+    float hdr_brightness = hdr ? 1.0f : 0.0f;
     if (!ctx->hdr_brightness_valid || ctx->hdr_brightness != hdr_brightness) {
         int ret = OH_NativeWindow_NativeWindowHandleOpt(
             ctx->native_window, SET_HDR_WHITE_POINT_BRIGHTNESS, hdr_brightness);
-        if (ret == 0) {
-            ctx->hdr_brightness = hdr_brightness;
-            ctx->hdr_brightness_valid = true;
-        } else {
+        ctx->hdr_brightness = hdr_brightness;
+        ctx->hdr_brightness_valid = !ret;
+        if (ret)
             MP_WARN(ctx, "Failed to set NativeWindow HDR brightness: %d\n", ret);
-        }
     }
 }
 
@@ -259,71 +375,75 @@ struct pl_color_space vo_ohos_preferred_csp(struct vo *vo)
 
 bool vo_ohos_set_color(struct vo *vo, struct mp_image_params *params)
 {
+    struct vo_ohos_state *ctx = vo->ohos;
     struct pl_color_space color = params ? params->color
                                          : pl_color_space_srgb;
 
     // --ohos-hdr-mode=no keeps the surface in SDR, which makes libplacebo tone
     // map the stream down instead of handing PQ/HLG to the compositor.
-    bool allow_hdr = vo->opts->ohos_hdr_mode != OHOS_HDR_MODE_OFF;
-
-    if (allow_hdr && is_hdr(&color)) {
+    if (vo->opts->ohos_hdr_mode != OHOS_HDR_MODE_OFF && is_hdr(&color)) {
         color.primaries = PL_COLOR_PRIM_BT_2020;
+        // HLG is scene referred and the system adapts it to the panel, so no
+        // display peak (--target-peak) is baked into it here.
+        if (color.transfer == PL_COLOR_TRC_HLG)
+            color.hdr = ctx->source.color.hdr;
         pl_color_space_infer(&color);
+
+        // The target's light levels are left as the colorspace hint set them:
+        // capped at the target peak when the stream is compressed into it,
+        // the stream's own when it passes through. Changing them here would
+        // make libplacebo map a stream it would otherwise pass untouched.
+        ohos_vivid_tone_map_params(&ctx->tone, ctx->color_map,
+                                   &ctx->source.color, &color);
     } else {
         color = pl_color_space_srgb;
     }
 
+    // This becomes the render target, so the window metadata derived from it
+    // describes the output, whether or not libplacebo tone maps.
     if (params)
         params->color = color;
-
-    struct pl_color_space window_color = color;
-    if (is_hdr(&color)) {
-        struct pl_color_space source = vo_get_current_params(vo).color;
-        if (source.transfer == color.transfer)
-            window_color.hdr = source.hdr;
-    }
-    set_output_color(vo, window_color);
+    update_window(vo, &color);
     return true;
 }
 
-void vo_ohos_set_frame(struct vo *vo, struct mp_image *mpi)
+// Which Dolby Vision metadata levels the stream carries, since what reaches
+// HDR Vivid depends on it, and its raw level 3 offsets, which move the
+// statistics HDR Vivid gets. Logged once, then on every change.
+static void log_dovi(struct vo_ohos_state *ctx, const struct mp_image *mpi)
+{
+    char desc[sizeof(ctx->dovi_desc)];
+    ohos_dovi_describe(mpi, desc, sizeof(desc));
+    if (!desc[0] || !strcmp(desc, ctx->dovi_desc))
+        return;
+    MP_VERBOSE(ctx, "Dolby Vision RPU levels: %s\n", desc);
+    memcpy(ctx->dovi_desc, desc, sizeof(desc));
+}
+
+void vo_ohos_set_frame(struct vo *vo, const struct vo_frame *frame,
+                       const struct pl_color_map_params *color_map)
 {
     struct vo_ohos_state *ctx = vo->ohos;
-    if (!ctx)
+    struct mp_image *mpi = frame->current;
+    if (!ctx || !mpi)
         return;
 
-    bool was_vivid = ctx->source_is_vivid;
-    ctx->source_is_vivid = false;
-
-    for (int n = 0; mpi && n < mpi->num_ff_side_data; n++) {
-        struct mp_ff_side_data *sd = &mpi->ff_side_data[n];
-        if (!sd->buf)
-            continue;
-
-        if (sd->type == AV_FRAME_DATA_DYNAMIC_HDR_VIVID) {
-            // Only the presence is recorded, never the payload. FFmpeg parses
-            // CUVA but cannot serialise it back: there is no
-            // av_dynamic_hdr_vivid_to_t35, here or upstream, and the raw T.35
-            // bytes are destroyed at SEI parse time. So the payload
-            // OH_HDR_DYNAMIC_METADATA wants cannot be reconstructed. Knowing
-            // the source was Vivid still lets us advertise the right type.
-            //
-            // Forwarding HDR10+ in its place is not a substitute, and was
-            // removed for being actively harmful: OHOS has no ST 2094-40
-            // metadata type, so those bytes could only be sent under
-            // OH_VIDEO_HDR_VIVID, which means a CUVA payload. A CUVA parser
-            // validates only system_start_code in 0x01..0x07, while
-            // av_dynamic_hdr_plus_to_t35 emits a headerless payload starting
-            // with application_version = 0x01 — so it is accepted and
-            // silently misparsed into garbage tone-curve parameters rather
-            // than rejected.
-            ctx->source_is_vivid = true;
-        }
+    // A new format or size is a new stream as much as a seek is.
+    if (!mp_image_params_static_equal(&ctx->source, &mpi->params)) {
+        ohos_vivid_tracker_reset(&ctx->vivid);
+        ctx->dovi_desc[0] = '\0';
     }
+    ctx->source = mpi->params;
+    ctx->color_map = color_map;
+    ohos_vivid_tracker_update(&ctx->vivid, mpi, frame->frame_id);
+    log_dovi(ctx, mpi);
+}
 
-    // The advertised metadata type depends on this, so force it to be resent.
-    if (was_vivid != ctx->source_is_vivid)
-        ctx->metadata_type_valid = false;
+void vo_ohos_reset(struct vo *vo)
+{
+    struct vo_ohos_state *ctx = vo->ohos;
+    if (ctx)
+        ohos_vivid_tracker_reset(&ctx->vivid);
 }
 
 void vo_ohos_invalidate_color(struct vo *vo)
@@ -333,5 +453,6 @@ void vo_ohos_invalidate_color(struct vo *vo)
     ctx->color_space_valid = false;
     ctx->metadata_type_valid = false;
     ctx->static_metadata_valid = false;
+    ctx->dynamic_metadata_size = 0;
     ctx->hdr_brightness_valid = false;
 }

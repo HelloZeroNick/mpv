@@ -1154,9 +1154,9 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
             .transfer = opts->target_trc ? opts->target_trc : pl_color_space_hdr10.transfer };
     }
 #if HAVE_OHOS
-    // Pick up HDR Vivid / HDR10+ side data before the colorspace hint is
-    // resolved, so the NativeWindow can be told which HDR flavour it carries.
-    vo_ohos_set_frame(vo, frame->current);
+    // Capture the frame's HDR description before the colorspace hint is
+    // resolved, so the NativeWindow metadata can describe the rendered output.
+    vo_ohos_set_frame(vo, frame, params.color_map_params);
 #endif
     if (target_hint && frame->current) {
         const struct pl_color_space *source = &frame->current->params.color;
@@ -1873,6 +1873,9 @@ static int control(struct vo *vo, uint32_t request, void *data)
     case VOCTRL_RESET:
         // Defer until the first new frame (unique ID) actually arrives
         p->want_reset = true;
+#if HAVE_OHOS
+        vo_ohos_reset(vo);
+#endif
         return VO_TRUE;
 
     case VOCTRL_PERFORMANCE_DATA: {

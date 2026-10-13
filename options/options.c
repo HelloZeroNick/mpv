@@ -256,8 +256,8 @@ static const m_option_t mp_vo_opt_list[] = {
         {"auto", OHOS_HDR_MODE_AUTO},
         {"no", OHOS_HDR_MODE_OFF},
         {"hdr10", OHOS_HDR_MODE_HDR10},
-        {"hlg", OHOS_HDR_MODE_HLG},
-        {"vivid", OHOS_HDR_MODE_VIVID})},
+        // Formerly forced HDR Vivid signalling, which auto now derives.
+        {"vivid", OHOS_HDR_MODE_AUTO})},
 #endif
 #if HAVE_D3D11
     {"d3d11-composition-size", OPT_SIZE_BOX(d3d11_composition_size)},
