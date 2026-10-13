@@ -38,6 +38,7 @@
 #include "osdep/threads.h"
 #include "stream/stream.h"
 #include "sub/draw_bmp.h"
+#include "video/dovi_tone_map.h"
 #include "video/fmt-conversion.h"
 #include "video/mp_image.h"
 #include "video/out/placebo/ra_pl.h"
@@ -140,6 +141,9 @@ struct priv {
     bool frame_pending;
 
     pl_options pars;
+    // The colour mapping a Dolby Vision frame is drawn with, see
+    // map_dovi_frame().
+    struct pl_color_map_params dovi_color_map;
     struct m_config_cache *opts_cache;
     struct m_config_cache *next_opts_cache;
     struct gl_next_opts *next_opts;
@@ -1002,6 +1006,20 @@ static void update_tm_viz(struct pl_color_map_params *params,
     params->visualize_hue = M_PI / 4.0;
 }
 
+// Dolby Vision is tone mapped the way Dolby's display management maps it,
+// unless another curve was asked for (see video/dovi_tone_map.c).
+static void map_dovi_frame(struct priv *p, struct pl_render_params *params,
+                           const struct mp_image *mpi)
+{
+    const struct gl_video_opts *opts = p->opts_cache->opts;
+    if (!mpi || !mpi->params.repr.dovi || !params->color_map_params ||
+        opts->tone_map.curve != TONE_MAPPING_AUTO)
+        return;
+    p->dovi_color_map = *params->color_map_params;
+    p->dovi_color_map.tone_mapping_function = &mp_dovi_tone_map;
+    params->color_map_params = &p->dovi_color_map;
+}
+
 static enum pl_color_primaries get_best_prim_container(const struct pl_raw_primaries *gamut)
 {
     enum pl_color_primaries container = PL_COLOR_PRIM_UNKNOWN;
@@ -1055,6 +1073,7 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
     params.preserve_mixing_cache = p->next_opts->inter_preserve && !frame->still;
     if (frame->still)
         params.frame_mixer = NULL;
+    map_dovi_frame(p, &params, frame->current);
 
     if (frame->current && frame->current->params.vflip) {
         pl_matrix2x2 m = { .m = {{1, 0}, {0, -1}}, };
@@ -1348,6 +1367,8 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
                     PL_OVERLAY_COORDS_DST_FRAME, &p->osd_state, &target, frame->current);
     apply_crop(&target, p->dst, swframe.fbo->params.w, swframe.fbo->params.h);
     update_tm_viz(&pars->color_map_params, &target);
+    if (params.color_map_params == &p->dovi_color_map)
+        update_tm_viz(&p->dovi_color_map, &target);
 
     struct pl_frame_mix mix = {0};
     if (frame->current) {
@@ -1643,6 +1664,7 @@ static void video_screenshot(struct vo *vo, struct voctrl_screenshot *args)
     // the resulting mix is the correct frame for this PTS
     struct pl_frame image = *(struct pl_frame *) mix.frames[0];
     struct mp_image *mpi = image.user_data;
+    map_dovi_frame(p, &params, mpi);
     struct mp_rect src = p->src, dst = p->dst;
     struct mp_osd_res osd = p->osd_res;
     if (!args->scaled) {
@@ -1738,6 +1760,8 @@ static void video_screenshot(struct vo *vo, struct voctrl_screenshot *args)
     apply_crop(&image, src, mpi->params.w, mpi->params.h);
     apply_crop(&target, dst, fbo->params.w, fbo->params.h);
     update_tm_viz(&pars->color_map_params, &target);
+    if (params.color_map_params == &p->dovi_color_map)
+        update_tm_viz(&p->dovi_color_map, &target);
 
     int osd_flags = 0;
     if (!args->subs)

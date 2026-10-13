@@ -206,12 +206,14 @@ static void log_dynamic_metadata(struct vo_ohos_state *ctx,
     int avg = (md[2] & 0xf) << 8 | md[3];
     int var = md[4] << 4 | md[5] >> 4;
     int max = (md[5] & 0xf) << 8 | md[6];
-    // When libplacebo compresses the picture, the average and peak it tone
-    // maps by as well: which luminance (Dolby Vision level 1 with level 3,
-    // say) reached the tone curve.
-    char tone[64] = "";
+    // When libplacebo compresses the picture, the curve and the average and
+    // peak it tone maps by as well: which curve (Dolby's for Dolby Vision, see
+    // video/dovi_tone_map.c) and which luminance (Dolby Vision level 1 with
+    // level 3, say) map the picture.
+    char tone[80] = "";
     if (!pl_tone_map_params_noop(&ctx->tone)) {
-        snprintf(tone, sizeof(tone), ", tone mapped from avg %ld max %ld",
+        snprintf(tone, sizeof(tone), ", tone mapped (%s) from avg %ld max %ld",
+                 ctx->tone.function->name,
                  lrintf(ctx->tone.input_avg * 4095),
                  lrintf(ctx->tone.input_max * 4095));
     }
