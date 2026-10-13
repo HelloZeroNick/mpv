@@ -19,6 +19,7 @@
 #include <stdio.h>
 #include <string.h>
 
+#include <libplacebo/shaders/colorspace.h>
 #include <libplacebo/tone_mapping.h>
 
 #include "ohos_common.h"
@@ -38,6 +39,10 @@ struct vo_ohos_state {
     struct ohos_vivid_tracker vivid;
     // The tone mapping from the frame to the current render target.
     struct pl_tone_map_params tone;
+    // The brightest the stream has shown so far (PQ): the peaks its frames
+    // carry (Dolby Vision, HDR Vivid) and libplacebo has measured, see
+    // vo_ohos_set_frame() and vo_ohos_set_measured_peak().
+    float observed_peak;
     // The stream's Dolby Vision RPU as last logged, see log_dovi().
     char dovi_desc[128];
 
@@ -87,10 +92,38 @@ static const char *metadata_type_name(OH_NativeBuffer_MetadataType type)
     }
 }
 
-// The window's colour space is a fully inferred render target, so this is
-// exactly the output: the source's own metadata when it passes through
-// untouched, the target luminance when libplacebo tone maps it down.
-//
+// The output as the window's metadata describes it: the render target, with
+// the light levels the picture actually reaches. libplacebo never raises a
+// stream's light levels unless asked to expand it (--inverse-tone-mapping):
+// it compresses what is brighter than the target into it and passes the rest
+// untouched. So a stream no brighter than the target, by its metadata and by
+// what it has shown so far, keeps its own light levels and is described
+// exactly as without a target peak: a target peak (--target-peak) above it
+// never makes the system show it any brighter. A brighter stream gets the
+// target's, as the colourspace hint set them. (An HLG target carries the
+// stream's own light levels already.)
+static struct pl_color_space get_output_color(
+    const struct vo_ohos_state *ctx, const struct pl_color_space *target)
+{
+    struct pl_color_space out = *target;
+    if (ctx->color_map && ctx->color_map->inverse_tone_mapping)
+        return out;
+
+    struct pl_color_space source = ctx->source.color;
+    pl_color_space_infer(&source);
+    const struct pl_hdr_metadata *hdr = &source.hdr;
+    float peak = MPMAX(hdr->max_cll ? hdr->max_cll : hdr->max_luma,
+                       pl_hdr_rescale(PL_HDR_PQ, PL_HDR_NITS,
+                                      ctx->observed_peak));
+    if (peak > target->hdr.max_luma)
+        return out;
+
+    out.hdr.max_luma = hdr->max_luma;
+    out.hdr.max_cll = peak;
+    out.hdr.max_fall = hdr->max_fall;
+    return out;
+}
+
 // The render service sizes the layer's HDR brightness from MaxCLL, so it is
 // never left at 0 (which grants no headroom at all): without a content light
 // level the peak stands in, as libplacebo itself assumes.
@@ -389,21 +422,22 @@ bool vo_ohos_set_color(struct vo *vo, struct mp_image_params *params)
             color.hdr = ctx->source.color.hdr;
         pl_color_space_infer(&color);
 
-        // The target's light levels are left as the colorspace hint set them:
-        // capped at the target peak when the stream is compressed into it,
-        // the stream's own when it passes through. Changing them here would
-        // make libplacebo map a stream it would otherwise pass untouched.
+        // The target's light levels are left as the colorspace hint set them,
+        // the target peak (--target-peak) included: libplacebo compresses
+        // only what is brighter, so lowering them to a stream's metadata
+        // would compress a stream brighter than its metadata says.
         ohos_vivid_tone_map_params(&ctx->tone, ctx->color_map,
                                    &ctx->source.color, &color);
     } else {
         color = pl_color_space_srgb;
     }
 
-    // This becomes the render target, so the window metadata derived from it
-    // describes the output, whether or not libplacebo tone maps.
+    // This becomes the render target; the window metadata describes the
+    // picture rendered into it, whether or not libplacebo tone maps.
     if (params)
         params->color = color;
-    update_window(vo, &color);
+    struct pl_color_space output = get_output_color(ctx, &color);
+    update_window(vo, &output);
     return true;
 }
 
@@ -431,19 +465,36 @@ void vo_ohos_set_frame(struct vo *vo, const struct vo_frame *frame,
     // A new format or size is a new stream as much as a seek is.
     if (!mp_image_params_static_equal(&ctx->source, &mpi->params)) {
         ohos_vivid_tracker_reset(&ctx->vivid);
+        ctx->observed_peak = 0;
         ctx->dovi_desc[0] = '\0';
     }
     ctx->source = mpi->params;
     ctx->color_map = color_map;
+    // Dolby Vision and HDR Vivid carry each frame's own peak, which libplacebo
+    // maps them by instead of measuring them.
+    const struct pl_hdr_metadata *hdr = &mpi->params.color.hdr;
+    if (pl_hdr_metadata_contains(hdr, PL_HDR_METADATA_CIE_Y))
+        ctx->observed_peak = MPMAX(ctx->observed_peak, hdr->max_pq_y);
     ohos_vivid_tracker_update(&ctx->vivid, mpi, frame->frame_id);
     log_dovi(ctx, mpi);
 }
 
+// libplacebo measures afresh after a seek or for a new file as well
+// (pl_renderer_flush_cache()).
 void vo_ohos_reset(struct vo *vo)
 {
     struct vo_ohos_state *ctx = vo->ohos;
+    if (!ctx)
+        return;
+    ohos_vivid_tracker_reset(&ctx->vivid);
+    ctx->observed_peak = 0;
+}
+
+void vo_ohos_set_measured_peak(struct vo *vo, float max_pq_y)
+{
+    struct vo_ohos_state *ctx = vo->ohos;
     if (ctx)
-        ohos_vivid_tracker_reset(&ctx->vivid);
+        ctx->observed_peak = MPMAX(ctx->observed_peak, max_pq_y);
 }
 
 void vo_ohos_invalidate_color(struct vo *vo)

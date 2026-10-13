@@ -56,5 +56,12 @@ void vo_ohos_set_frame(struct vo *vo, const struct vo_frame *frame,
                        const struct pl_color_map_params *color_map);
 
 // A seek or a new file (VOCTRL_RESET): the dynamic metadata of the stream
-// shown so far is dropped once a frame from the new position arrives.
+// shown so far is dropped once a frame from the new position arrives, the
+// peak it has shown at once.
 void vo_ohos_reset(struct vo *vo);
+
+// The peak libplacebo's detection (--hdr-compute-peak) holds after the frame
+// just drawn, smoothed over the scene, as a PQ value. The brightest of the
+// stream so far raises the window's light levels where the stream's metadata
+// understates them.
+void vo_ohos_set_measured_peak(struct vo *vo, float max_pq_y);
