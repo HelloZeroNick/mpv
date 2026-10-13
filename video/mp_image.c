@@ -37,6 +37,7 @@
 
 #include "common/av_common.h"
 #include "common/common.h"
+#include "dovi_hdr.h"
 #include "fmt-conversion.h"
 #include "hwdec.h"
 #include "mp_image.h"
@@ -1206,11 +1207,9 @@ struct mp_image *mp_image_from_av_frame(struct AVFrame *src)
 #endif
     }
 
-    sd = av_frame_get_side_data(src, AV_FRAME_DATA_DOVI_RPU_BUFFER);
-    if (sd) {
-        pl_hdr_metadata_from_dovi_rpu(&dst->params.color.hdr, sd->buf->data,
-                                      sd->buf->size);
-    }
+    // Dolby Vision: libdovi's pl_hdr_metadata_from_dovi_rpu() and the levels
+    // libplacebo does not map, see dovi_hdr.h.
+    mp_dovi_map_hdr(&dst->params.color.hdr, src);
 
     // HDR Vivid (CUVA) dynamic metadata. libplacebo has no CUVA support, but
     // its CIE_Y channel takes exactly the quantity HDR Vivid carries: a PQ

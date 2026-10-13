@@ -209,6 +209,7 @@ sources = files(
     ## Video
     'video/csputils.c',
     'video/decode/vd_lavc.c',
+    'video/dovi_hdr.c',
     'video/filter/refqueue.c',
     'video/filter/vf_format.c',
     'video/filter/vf_sub.c',
