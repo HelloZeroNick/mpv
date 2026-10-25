@@ -87,23 +87,14 @@ fail:
 static bool ohos_reconfig(struct ra_ctx *ctx)
 {
     int w, h;
-    if (!vo_ohos_surface_size(ctx->vo, &w, &h))
+    if (!vo_ohos_ensure_surface_size(ctx->vo, &w, &h))
         return false;
 
-    // Same as the GL context: external_window.h documents SET_BUFFER_GEOMETRY
-    // as a prerequisite for producing buffers, and nothing else on this path
-    // establishes it. ra_vk_ctx_resize() does write the extent libplacebo
-    // actually granted back into vo->dwidth/dheight, so this path degrades more
-    // gracefully than the GL one -- but the buffer still has to be sized up
-    // front, or the swapchain is negotiated against a window whose geometry was
-    // never set. SET takes (width, height); the GET in vo_ohos_surface_size()
-    // returns (height, width).
-    OHNativeWindow *native_window = vo_ohos_native_window(ctx->vo);
-    if (native_window) {
-        OH_NativeWindow_NativeWindowHandleOpt(native_window,
-                                              SET_BUFFER_GEOMETRY, w, h);
-    }
-
+    // vo_ohos_ensure_surface_size() leaves the buffer queue sized to w x h,
+    // either because the embedder had not sized it yet or because
+    // --ohos-surface-size asked for something else. ra_vk_ctx_resize() then
+    // writes back the extent libplacebo actually granted into
+    // vo->dwidth/dheight.
     bool ok = ra_vk_ctx_resize(ctx, w, h);
     vo_ohos_invalidate_color(ctx->vo);
     return ok;

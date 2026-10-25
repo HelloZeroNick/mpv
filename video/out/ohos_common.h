@@ -42,7 +42,7 @@ enum ohos_hdr_mode {
 bool vo_ohos_init(struct vo *vo);
 void vo_ohos_uninit(struct vo *vo);
 OHNativeWindow *vo_ohos_native_window(struct vo *vo);
-bool vo_ohos_surface_size(struct vo *vo, int *w, int *h);
+bool vo_ohos_ensure_surface_size(struct vo *vo, int *w, int *h);
 struct pl_color_space vo_ohos_preferred_csp(struct vo *vo);
 bool vo_ohos_set_color(struct vo *vo, struct mp_image_params *params);
 void vo_ohos_invalidate_color(struct vo *vo);

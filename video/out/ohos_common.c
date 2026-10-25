@@ -379,14 +379,62 @@ OHNativeWindow *vo_ohos_native_window(struct vo *vo)
     return ctx->native_window;
 }
 
-bool vo_ohos_surface_size(struct vo *vo, int *out_w, int *out_h)
+// Reads the geometry the producer buffer queue currently carries. HarmonyOS
+// keeps it on the Surface, so it is also what the consumer side set: Flutter's
+// SetTextureBufferSize and a native XComponent both end up here.
+static bool get_buffer_geometry(struct vo_ohos_state *ctx, int *out_w, int *out_h)
+{
+    if (!ctx->native_window)
+        return false;
+
+    // GET_BUFFER_GEOMETRY writes height first, width second.
+    int w = 0, h = 0;
+    int ret = OH_NativeWindow_NativeWindowHandleOpt(ctx->native_window,
+                                                    GET_BUFFER_GEOMETRY, &h, &w);
+    if (ret || w <= 0 || h <= 0)
+        return false;
+
+    *out_w = w;
+    *out_h = h;
+    return true;
+}
+
+static void set_buffer_geometry(struct vo_ohos_state *ctx, int w, int h)
+{
+    if (!ctx->native_window)
+        return;
+
+    // SET_BUFFER_GEOMETRY takes width first, height second -- the opposite of
+    // the GET above.
+    int ret = OH_NativeWindow_NativeWindowHandleOpt(ctx->native_window,
+                                                    SET_BUFFER_GEOMETRY, w, h);
+    if (ret)
+        MP_WARN(ctx, "Failed to set NativeWindow geometry %dx%d: %d\n", w, h, ret);
+}
+
+bool vo_ohos_ensure_surface_size(struct vo *vo, int *out_w, int *out_h)
 {
     struct vo_ohos_state *ctx = vo->ohos;
+    if (!ctx)
+        return false;
+
+    int qw, qh;
+    bool queue_sized = get_buffer_geometry(ctx, &qw, &qh);
 
     int w = vo->opts->ohos_surface_size.w,
         h = vo->opts->ohos_surface_size.h;
-    if (!w || !h)
-        OH_NativeWindow_NativeWindowHandleOpt(ctx->native_window, GET_BUFFER_GEOMETRY, &h, &w);
+    if (w > 0 && h > 0) {
+        // --ohos-surface-size names the size to render at. Push it into the
+        // queue only when the queue does not already carry that geometry: the
+        // embedder usually sizes the surface itself before it tells mpv, and
+        // repeating the SET makes the driver re-negotiate the producer buffer
+        // pool on every video change.
+        if (!queue_sized || qw != w || qh != h)
+            set_buffer_geometry(ctx, w, h);
+    } else if (queue_sized) {
+        w = qw;
+        h = qh;
+    }
 
     if (w <= 0 || h <= 0) {
         MP_ERR(ctx, "Failed to get height and width.\n");
