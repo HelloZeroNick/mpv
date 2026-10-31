@@ -27,6 +27,7 @@
 #include "osdep/threads.h"
 #include "osdep/timer.h"
 
+#include <stdatomic.h>
 #include <ohaudio/native_audiorenderer.h>
 #include <ohaudio/native_audiostreambuilder.h>
 
@@ -41,6 +42,13 @@ struct priv {
     bool timestamp_valid;
 
     int encoding_type;
+
+    // Set by set_pause()/reset()/start(); the interrupt callback must not
+    // resume the stream when the player itself wants silence.
+    atomic_bool user_paused;
+    // Set while the system has taken the focus away (call, other app, ...).
+    // Cleared again by the next AUDIOSTREAM_INTERRUPT_HINT_RESUME.
+    atomic_bool interrupted;
 };
 
 static void reset_timing(struct priv *p)
@@ -129,6 +137,92 @@ static OH_AudioData_Callback_Result audio_on_write_callback(
     return AUDIO_DATA_CALLBACK_RESULT_VALID;
 }
 
+// Audio focus was taken away (incoming call, alarm, other app, ...). With
+// AUDIOSTREAM_INTERRUPT_FORCE the system has already paused the stream, and
+// playback does NOT resume on its own once the focus returns: the resume
+// hint has to be handled here, or audio stays silent forever while the video
+// keeps playing. Runs on an OHAudio thread.
+static void audio_on_interrupt_callback(
+    OH_AudioRenderer* renderer,
+    void* userData,
+    OH_AudioInterrupt_ForceType type,
+    OH_AudioInterrupt_Hint hint)
+{
+    struct ao* ao = userData;
+    struct priv* p = ao->priv;
+
+    switch (hint) {
+    case AUDIOSTREAM_INTERRUPT_HINT_PAUSE:
+    case AUDIOSTREAM_INTERRUPT_HINT_STOP:
+    case AUDIOSTREAM_INTERRUPT_HINT_MUTE:
+        atomic_store(&p->interrupted, true);
+        reset_timing(p);
+        MP_WARN(ao, "Audio interrupted by the system (hint %d).\n", (int)hint);
+        break;
+    case AUDIOSTREAM_INTERRUPT_HINT_RESUME:
+    case AUDIOSTREAM_INTERRUPT_HINT_UNMUTE:
+        atomic_store(&p->interrupted, false);
+        // Only restart when the player itself is not paused; otherwise the
+        // next user-initiated unpause calls set_pause(false) -> Start().
+        if (!atomic_load(&p->user_paused)) {
+            OH_AudioStream_Result res = OH_AudioRenderer_Start(renderer);
+            if (res != AUDIOSTREAM_SUCCESS) {
+                MP_ERR(ao, "Fail to resume after interruption: error code %d.\n",
+                       res);
+            } else {
+                MP_VERBOSE(ao, "Resumed after audio interruption.\n");
+            }
+        }
+        p->last_query = 0;
+        break;
+    case AUDIOSTREAM_INTERRUPT_HINT_DUCK:
+    case AUDIOSTREAM_INTERRUPT_HINT_UNDUCK:
+    default:
+        // Volume ducking is applied by the system on FORCE events; nothing
+        // to do for a movie player.
+        break;
+    }
+}
+
+// Fatal stream errors (audio service crash, ...). Ask the player core to
+// tear down and reinitialize the whole AO, mirroring ao_aaudio.c.
+static void audio_on_error_callback(
+    OH_AudioRenderer* renderer,
+    void* userData,
+    OH_AudioStream_Result error)
+{
+    struct ao* ao = userData;
+
+    MP_ERR(ao, "OHAudio stream error: %d, requesting AO reload.\n", (int)error);
+    ao_request_reload(ao);
+}
+
+// Output device switched (BT, headphones, ...). The frame position restarts
+// on the new device, so drop the timing epoch; the write callback rebuilds
+// it. When the old device disappeared, some systems leave the stream paused
+// - restart it unless the player itself is paused.
+static void audio_on_device_change_callback(
+    OH_AudioRenderer* renderer,
+    void* userData,
+    OH_AudioStream_DeviceChangeReason reason)
+{
+    struct ao* ao = userData;
+    struct priv* p = ao->priv;
+
+    MP_VERBOSE(ao, "Output device changed, reason %d.\n", (int)reason);
+    reset_timing(p);
+
+    if (reason == REASON_OLD_DEVICE_UNAVAILABLE &&
+        !atomic_load(&p->user_paused))
+    {
+        OH_AudioStream_Result res = OH_AudioRenderer_Start(renderer);
+        if (res != AUDIOSTREAM_SUCCESS) {
+            MP_ERR(ao, "Fail to restart after device change: error code %d.\n",
+                   res);
+        }
+    }
+}
+
 static int init(struct ao* ao)
 {
     struct priv* p = ao->priv;
@@ -178,6 +272,12 @@ static int init(struct ao* ao)
 
     OH_AudioRenderer_OnWriteDataCallback callback = audio_on_write_callback;
     OH_AudioStreamBuilder_SetRendererWriteDataCallback(p->builder, callback, ao);
+    OH_AudioStreamBuilder_SetRendererInterruptCallback(p->builder,
+        audio_on_interrupt_callback, ao);
+    OH_AudioStreamBuilder_SetRendererErrorCallback(p->builder,
+        audio_on_error_callback, ao);
+    OH_AudioStreamBuilder_SetRendererOutputDeviceChangeCallback(p->builder,
+        audio_on_device_change_callback, ao);
 
     res = OH_AudioStreamBuilder_GenerateRenderer(p->builder, &p->renderer);
 
@@ -186,6 +286,8 @@ static int init(struct ao* ao)
         goto error;
     }
 
+    atomic_init(&p->user_paused, false);
+    atomic_init(&p->interrupted, false);
     reset_timing(p);
 
     return 0;
@@ -200,6 +302,9 @@ static int control(struct ao *ao, enum aocontrol cmd, void *arg)
     float volume;
     float *vol = arg;
     OH_AudioStream_Result res = 0;
+
+    if (!p->renderer)
+        return CONTROL_ERROR;
 
     switch (cmd) {
     case AOCONTROL_GET_VOLUME:
@@ -223,10 +328,11 @@ static int control(struct ao *ao, enum aocontrol cmd, void *arg)
     return CONTROL_OK;
 }
 
-static void reset(struct ao *ao)
+static void reset(struct ao* ao)
 {
-    struct priv *p = ao->priv;
+    struct priv* p = ao->priv;
 
+    atomic_store(&p->user_paused, true);
     OH_AudioRenderer_Pause(p->renderer);
     OH_AudioRenderer_Flush(p->renderer);
     reset_timing(p);
@@ -234,8 +340,9 @@ static void reset(struct ao *ao)
 
 static bool set_pause(struct ao *ao, bool paused)
 {
-    struct priv *p = ao->priv;
+    struct priv* p = ao->priv;
 
+    atomic_store(&p->user_paused, paused);
     if (paused) {
         OH_AudioRenderer_Pause(p->renderer);
     } else {
@@ -245,10 +352,11 @@ static bool set_pause(struct ao *ao, bool paused)
     return true;
 }
 
-static void start(struct ao *ao)
+static void start(struct ao* ao)
 {
-    struct priv *p = ao->priv;
+    struct priv* p = ao->priv;
 
+    atomic_store(&p->user_paused, false);
     OH_AudioRenderer_Start(p->renderer);
 }
 
