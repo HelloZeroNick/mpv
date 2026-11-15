@@ -31,6 +31,16 @@
 #include <ohaudio/native_audiorenderer.h>
 #include <ohaudio/native_audiostreambuilder.h>
 
+// When the audio service stops pulling data (app background freeze, focus
+// takeover, ...) while mpv still considers the stream playing, the write
+// callback stops firing and nothing else signals the outage: interrupt hints
+// may never reach us (delivered while the process was frozen) and no error
+// callback fires because nothing failed. The watchdog closes that gap.
+#define WATCHDOG_TICK_NS MP_TIME_MS_TO_NS(1000)
+#define WATCHDOG_STALL_START MP_TIME_S_TO_NS(3)
+#define WATCHDOG_RETRY_INTERVAL MP_TIME_S_TO_NS(3)
+#define WATCHDOG_STALL_RELOAD MP_TIME_S_TO_NS(20)
+
 struct priv {
     OH_AudioStreamBuilder* builder;
     OH_AudioRenderer *renderer;
@@ -49,6 +59,15 @@ struct priv {
     // Set while the system has taken the focus away (call, other app, ...).
     // Cleared again by the next AUDIOSTREAM_INTERRUPT_HINT_RESUME.
     atomic_bool interrupted;
+    // Timestamp of the last write-callback invocation, as mp_time_ns().
+    atomic_ullong last_write_ns;
+    // Whether the driver has been asked to play (start/set_pause(false)).
+    atomic_bool started;
+    // Watchdog bookkeeping, all owned by the watchdog thread.
+    atomic_bool watchdog_exit;
+    atomic_ullong last_start_retry_ns;
+    mp_thread watchdog_thread;
+    bool watchdog_valid;
 };
 
 static void reset_timing(struct priv *p)
@@ -61,9 +80,107 @@ static void reset_timing(struct priv *p)
     p->timestamp_valid = false;
 }
 
+// Best-effort state-aware restart of the renderer. Safe to call from any
+// thread; tolerates a NULL renderer and already-running streams.
+static bool try_restart(struct ao* ao, const char *reason)
+{
+    struct priv* p = ao->priv;
+
+    if (!p->renderer || atomic_load(&p->user_paused))
+        return false;
+
+    OH_AudioStream_State state = AUDIOSTREAM_STATE_INVALID;
+    if (OH_AudioRenderer_GetCurrentState(p->renderer, &state) ==
+            AUDIOSTREAM_SUCCESS &&
+        state == AUDIOSTREAM_STATE_RUNNING)
+        return true;
+
+    OH_AudioStream_Result res = OH_AudioRenderer_Start(p->renderer);
+    if (res == AUDIOSTREAM_SUCCESS) {
+        MP_WARN(ao, "Restarted audio renderer (%s).\n", reason);
+        p->last_query = 0;
+        return true;
+    }
+    MP_ERR(ao, "Fail to restart audio renderer (%s): error code %d.\n",
+           reason, res);
+    return false;
+}
+
+static MP_THREAD_VOID watchdog_thread(void *arg)
+{
+    struct ao* ao = arg;
+    struct priv* p = ao->priv;
+
+    while (!atomic_load(&p->watchdog_exit)) {
+        mp_sleep_ns(WATCHDOG_TICK_NS);
+        if (atomic_load(&p->watchdog_exit))
+            break;
+
+        if (!atomic_load(&p->started) || atomic_load(&p->user_paused))
+            continue;
+
+        // At EOF the core keeps the stream RUNNING and the write callback is
+        // still invoked with silence-padded buffers, so a silent callback
+        // uniquely means the audio service stopped pulling data while mpv
+        // believes we are playing.
+        unsigned long long last = atomic_load(&p->last_write_ns);
+        if (!last)
+            continue;
+        int64_t stall = mp_time_ns() - (int64_t)last;
+        if (stall < WATCHDOG_STALL_START)
+            continue;
+
+        OH_AudioStream_State state = AUDIOSTREAM_STATE_INVALID;
+        bool state_ok = p->renderer &&
+            OH_AudioRenderer_GetCurrentState(p->renderer, &state) ==
+                AUDIOSTREAM_SUCCESS;
+
+        // A running service with a silent callback is odd, but restarting a
+        // running stream is wrong; only give up after a very long outage.
+        if (state_ok && state == AUDIOSTREAM_STATE_RUNNING &&
+            stall < WATCHDOG_STALL_RELOAD)
+            continue;
+
+        // A very long outage means every in-place recovery is exhausted (or
+        // impossible): ask the core to rebuild the whole audio output chain.
+        // Reload re-creates the renderer, which also re-requests audio focus,
+        // so it recovers even when the stream died server-side.
+        if (stall >= WATCHDOG_STALL_RELOAD) {
+            MP_ERR(ao, "Audio output stalled for %.1fs, requesting AO reload.\n",
+                   stall / 1e9);
+            ao_request_reload(ao);
+            // The core will uninit this AO soon; stop watchdog actions until
+            // then by pretending we are paused.
+            atomic_store(&p->user_paused, true);
+            continue;
+        }
+
+        // Otherwise try a throttled in-place restart first: the audio service
+        // refuses focus requests from a frozen/backgrounded app, so keep
+        // retrying while the app stays in the background; it succeeds right
+        // after returning to the foreground.
+        unsigned long long last_retry = atomic_load(&p->last_start_retry_ns);
+        if (mp_time_ns() - (int64_t)last_retry >= WATCHDOG_RETRY_INTERVAL) {
+            atomic_store(&p->last_start_retry_ns, (unsigned long long)mp_time_ns());
+            if (try_restart(ao, "watchdog")) {
+                // The restart succeeded: the write callback resumes and the
+                // stall clears on its own; nothing more to do this tick.
+                continue;
+            }
+        }
+    }
+    MP_THREAD_RETURN();
+}
+
 static void uninit(struct ao* ao)
 {
     struct priv* p = ao->priv;
+
+    if (p->watchdog_valid) {
+        atomic_store(&p->watchdog_exit, true);
+        mp_thread_join(p->watchdog_thread);
+        p->watchdog_valid = false;
+    }
 
     if (p->renderer) {
         uint32_t underflows;
@@ -90,6 +207,8 @@ static OH_AudioData_Callback_Result audio_on_write_callback(
 {
     struct ao* ao = userData;
     struct priv* p = ao->priv;
+
+    atomic_store(&p->last_write_ns, (unsigned long long)mp_time_ns());
 
     int samples = audioDataSize / ao->sstride;
     int64_t now = mp_time_ns();
@@ -153,11 +272,20 @@ static void audio_on_interrupt_callback(
 
     switch (hint) {
     case AUDIOSTREAM_INTERRUPT_HINT_PAUSE:
-    case AUDIOSTREAM_INTERRUPT_HINT_STOP:
     case AUDIOSTREAM_INTERRUPT_HINT_MUTE:
         atomic_store(&p->interrupted, true);
         reset_timing(p);
         MP_WARN(ao, "Audio interrupted by the system (hint %d).\n", (int)hint);
+        break;
+    case AUDIOSTREAM_INTERRUPT_HINT_STOP:
+        // A stop hint is terminal: no resume hint will ever follow. Try to
+        // take the focus back immediately (works once the competing stream
+        // releases it); if that fails the watchdog keeps retrying.
+        atomic_store(&p->interrupted, true);
+        reset_timing(p);
+        MP_WARN(ao, "Audio stopped by the system (hint %d).\n", (int)hint);
+        if (!atomic_load(&p->user_paused))
+            try_restart(ao, "interrupt stop");
         break;
     case AUDIOSTREAM_INTERRUPT_HINT_RESUME:
     case AUDIOSTREAM_INTERRUPT_HINT_UNMUTE:
@@ -166,11 +294,14 @@ static void audio_on_interrupt_callback(
         // next user-initiated unpause calls set_pause(false) -> Start().
         if (!atomic_load(&p->user_paused)) {
             OH_AudioStream_Result res = OH_AudioRenderer_Start(renderer);
-            if (res != AUDIOSTREAM_SUCCESS) {
+            if (res == AUDIOSTREAM_SUCCESS) {
+                MP_VERBOSE(ao, "Resumed after audio interruption.\n");
+            } else {
+                // Leave the recovery to the watchdog: hint races with the
+                // service resuming on its own are common, and a start that
+                // fails now may succeed once the service settles.
                 MP_ERR(ao, "Fail to resume after interruption: error code %d.\n",
                        res);
-            } else {
-                MP_VERBOSE(ao, "Resumed after audio interruption.\n");
             }
         }
         p->last_query = 0;
@@ -212,15 +343,8 @@ static void audio_on_device_change_callback(
     MP_VERBOSE(ao, "Output device changed, reason %d.\n", (int)reason);
     reset_timing(p);
 
-    if (reason == REASON_OLD_DEVICE_UNAVAILABLE &&
-        !atomic_load(&p->user_paused))
-    {
-        OH_AudioStream_Result res = OH_AudioRenderer_Start(renderer);
-        if (res != AUDIOSTREAM_SUCCESS) {
-            MP_ERR(ao, "Fail to restart after device change: error code %d.\n",
-                   res);
-        }
-    }
+    if (reason == REASON_OLD_DEVICE_UNAVAILABLE)
+        try_restart(ao, "device change");
 }
 
 static int init(struct ao* ao)
@@ -288,7 +412,17 @@ static int init(struct ao* ao)
 
     atomic_init(&p->user_paused, false);
     atomic_init(&p->interrupted, false);
+    atomic_init(&p->last_write_ns, 0);
+    atomic_init(&p->started, false);
+    atomic_init(&p->watchdog_exit, false);
+    atomic_init(&p->last_start_retry_ns, 0);
     reset_timing(p);
+
+    if (mp_thread_create(&p->watchdog_thread, watchdog_thread, ao) != 0) {
+        MP_ERR(ao, "Fail to create audio watchdog thread.\n");
+        goto error;
+    }
+    p->watchdog_valid = true;
 
     return 0;
 error:
@@ -333,8 +467,11 @@ static void reset(struct ao* ao)
     struct priv* p = ao->priv;
 
     atomic_store(&p->user_paused, true);
-    OH_AudioRenderer_Pause(p->renderer);
-    OH_AudioRenderer_Flush(p->renderer);
+    atomic_store(&p->started, false);
+    if (p->renderer) {
+        OH_AudioRenderer_Pause(p->renderer);
+        OH_AudioRenderer_Flush(p->renderer);
+    }
     reset_timing(p);
 }
 
@@ -344,10 +481,19 @@ static bool set_pause(struct ao *ao, bool paused)
 
     atomic_store(&p->user_paused, paused);
     if (paused) {
-        OH_AudioRenderer_Pause(p->renderer);
+        atomic_store(&p->started, false);
+        if (p->renderer)
+            OH_AudioRenderer_Pause(p->renderer);
     } else {
+        atomic_store(&p->started, true);
+        atomic_store(&p->last_write_ns, 0);
         p->last_query = 0;
-        OH_AudioRenderer_Start(p->renderer);
+        if (p->renderer) {
+            OH_AudioStream_Result res = OH_AudioRenderer_Start(p->renderer);
+            if (res != AUDIOSTREAM_SUCCESS)
+                MP_ERR(ao, "Fail to start audio renderer: error code %d.\n",
+                       res);
+        }
     }
     return true;
 }
@@ -357,7 +503,14 @@ static void start(struct ao* ao)
     struct priv* p = ao->priv;
 
     atomic_store(&p->user_paused, false);
-    OH_AudioRenderer_Start(p->renderer);
+    atomic_store(&p->started, true);
+    atomic_store(&p->last_write_ns, 0);
+    p->last_query = 0;
+    if (p->renderer) {
+        OH_AudioStream_Result res = OH_AudioRenderer_Start(p->renderer);
+        if (res != AUDIOSTREAM_SUCCESS)
+            MP_ERR(ao, "Fail to start audio renderer: error code %d.\n", res);
+    }
 }
 
 #define OPT_BASE_STRUCT struct priv
