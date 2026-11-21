@@ -15,6 +15,8 @@
  * License along with mpv.  If not, see <http://www.gnu.org/licenses/>.
  */
 
+#include "config.h"
+
 #include <math.h>
 #include <stdio.h>
 #include <string.h>
@@ -22,18 +24,19 @@
 #include <libplacebo/shaders/colorspace.h>
 #include <libplacebo/tone_mapping.h>
 
-#if HAVE_NATIVE_DISPLAY_MANAGER
-// Display refresh rate for VOCTRL_GET_DISPLAY_FPS; see
-// vo_ohos_display_fps(). Guarded so the build works against an SDK that
-// predates API 12.
-#include <window_manager/oh_display_manager.h>
-#endif
-
 #include "ohos_common.h"
 #include "ohos_hdr_vivid.h"
 #include "common/msg.h"
 #include "video/mp_image.h"
 #include "vo.h"
+
+// Display refresh rate for VOCTRL_GET_DISPLAY_FPS; see vo_ohos_display_fps().
+// Guarded so a build whose SDK predates API 12 and has no display manager
+// header still compiles, in which case the VOCTRL keeps reporting
+// VO_NOTIMPL-ish behaviour and display-synced modes stay off.
+#if HAVE_NATIVE_DISPLAY_MANAGER
+#include <window_manager/oh_display_manager.h>
+#endif
 
 struct vo_ohos_state {
     struct mp_log *log;
