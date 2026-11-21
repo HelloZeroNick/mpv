@@ -102,6 +102,15 @@ static bool ohos_reconfig(struct ra_ctx *ctx)
 
 static int ohos_control(struct ra_ctx *ctx, int *events, int request, void *arg)
 {
+    switch (request) {
+    case VOCTRL_GET_DISPLAY_FPS: {
+        double fps = vo_ohos_display_fps(ctx->vo);
+        if (fps <= 0)
+            return VO_NOTIMPL;
+        *(double *)arg = fps;
+        return VO_TRUE;
+    }
+    }
     return VO_NOTIMPL;
 }
 

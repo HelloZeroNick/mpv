@@ -22,6 +22,13 @@
 #include <libplacebo/shaders/colorspace.h>
 #include <libplacebo/tone_mapping.h>
 
+#if HAVE_NATIVE_DISPLAY_MANAGER
+// Display refresh rate for VOCTRL_GET_DISPLAY_FPS; see
+// vo_ohos_display_fps(). Guarded so the build works against an SDK that
+// predates API 12.
+#include <window_manager/oh_display_manager.h>
+#endif
+
 #include "ohos_common.h"
 #include "ohos_hdr_vivid.h"
 #include "common/msg.h"
@@ -377,6 +384,36 @@ OHNativeWindow *vo_ohos_native_window(struct vo *vo)
 {
     struct vo_ohos_state *ctx = vo->ohos;
     return ctx->native_window;
+}
+
+/*
+ * Display refresh rate, for VOCTRL_GET_DISPLAY_FPS.
+ *
+ * Without this the core has no vsync interval at all: vo_get_vsync_interval()
+ * returns -1, handle_display_sync_frame() bails out immediately, and every
+ * --video-sync=display-* mode degrades to plain audio sync without saying so.
+ * That silent degradation is why --display-fps-override used to be the only
+ * way to make those modes do anything on HarmonyOS.
+ *
+ * Reported in whole Hz, which is what the platform exposes; the panel may run
+ * at a rate the API does not distinguish (120 vs 119.88), and mpv's own
+ * vsync measurement refines it from there.
+ */
+double vo_ohos_display_fps(struct vo *vo)
+{
+#if HAVE_NATIVE_DISPLAY_MANAGER
+    uint32_t rate = 0;
+    NativeDisplayManager_ErrorCode err =
+        OH_NativeDisplayManager_GetDefaultDisplayRefreshRate(&rate);
+    if (err == DISPLAY_MANAGER_OK && rate > 0)
+        return (double)rate;
+    MP_VERBOSE(vo, "Display refresh rate unavailable (err %d), "
+                   "display-synced modes stay disabled.\n", (int)err);
+#else
+    MP_VERBOSE(vo, "Built without native_display_manager, display-synced "
+                   "modes stay disabled.\n");
+#endif
+    return 0.0;
 }
 
 // Reads the geometry the producer buffer queue currently carries. HarmonyOS

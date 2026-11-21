@@ -42,6 +42,15 @@ enum ohos_hdr_mode {
 bool vo_ohos_init(struct vo *vo);
 void vo_ohos_uninit(struct vo *vo);
 OHNativeWindow *vo_ohos_native_window(struct vo *vo);
+
+// Current refresh rate of the default display, in Hz, or 0 when the platform
+// does not report one. Answers VOCTRL_GET_DISPLAY_FPS: without it mpv has no
+// vsync interval, and every display-synced mode (--video-sync=display-*)
+// silently disables itself, leaving --display-fps-override as the only way to
+// get one. Queried on each call rather than cached, because the panel rate
+// follows content (VRR) and power state.
+double vo_ohos_display_fps(struct vo *vo);
+
 bool vo_ohos_ensure_surface_size(struct vo *vo, int *w, int *h);
 struct pl_color_space vo_ohos_preferred_csp(struct vo *vo);
 bool vo_ohos_set_color(struct vo *vo, struct mp_image_params *params);

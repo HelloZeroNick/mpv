@@ -487,7 +487,18 @@ if features['ohos']
                      cc.find_library('native_media_vdec'),
                      cc.find_library('native_buffer'),
                      cc.find_library('native_image'),
-                     cc.find_library('native_window')]
+                     cc.find_library('native_window'),
+                     # Display refresh rate, used to answer
+                     # VOCTRL_GET_DISPLAY_FPS. Optional: a build without it
+                     # still works, display-synced sync modes then fall back
+                     # to --display-fps-override.
+                     cc.find_library('native_display_manager', required: false)]
+    # Display refresh rate for VOCTRL_GET_DISPLAY_FPS (API 12+). Registered as
+    # a feature so the config.h loop generates HAVE_NATIVE_DISPLAY_MANAGER;
+    # an SDK without the header still builds and display-synced modes simply
+    # stay disabled, exactly as before.
+    features += {'native-display-manager': cc.has_header(
+        'window_manager/oh_display_manager.h')}
     sources += files('audio/out/ao_ohaudio.c',
                      'video/out/ohos_common.c',
                      'video/out/ohos_hdr_vivid.c',

@@ -28,6 +28,10 @@ struct priv {
     EGLDisplay egl_display;
     EGLContext egl_context;
     EGLSurface egl_surface;
+    // EGLConfig the context was created with. Kept on the context rather than
+    // a local so the surface can be recreated later with the same pixel
+    // format; creating it with a provisional config would risk EGL_BAD_MATCH.
+    EGLConfig egl_config;
 };
 
 static pl_color_space_t ohos_preferred_csp(struct ra_ctx *ctx)
@@ -43,7 +47,37 @@ static void ohos_set_color(struct ra_ctx *ctx, struct mp_image_params *params)
 static void ohos_swap_buffers(struct ra_ctx *ctx)
 {
     struct priv *p = ctx->priv;
-    eglSwapBuffers(p->egl_display, p->egl_surface);
+    if (eglSwapBuffers(p->egl_display, p->egl_surface))
+        return;
+
+    // A failed swap is normally EGL_BAD_SURFACE / EGL_CONTEXT_LOST: the
+    // surface went away under us (XComponent recreated, compositor dropped
+    // the consumer). Ignoring it used to leave a frozen picture with no
+    // diagnostic at all. Rebuild the surface so the next frame has one.
+    EGLint err = eglGetError();
+    MP_WARN(ctx, "eglSwapBuffers failed: 0x%x, recreating surface\n",
+            (unsigned)err);
+
+    if (p->egl_surface != EGL_NO_SURFACE) {
+        eglMakeCurrent(p->egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE,
+                       EGL_NO_CONTEXT);
+        eglDestroySurface(p->egl_display, p->egl_surface);
+        p->egl_surface = EGL_NO_SURFACE;
+    }
+
+    OHNativeWindow *native_window = vo_ohos_native_window(ctx->vo);
+    if (native_window) {
+        p->egl_surface = eglCreateWindowSurface(p->egl_display, p->egl_config,
+                                        (EGLNativeWindowType)native_window,
+                                        NULL);
+    }
+    if (p->egl_surface == EGL_NO_SURFACE ||
+        !eglMakeCurrent(p->egl_display, p->egl_surface, p->egl_surface,
+                        p->egl_context)) {
+        MP_ERR(ctx, "Could not recreate the EGL surface after a failed "
+                    "swap; the picture will not recover until the output is "
+                    "reconfigured\n");
+    }
 }
 
 static void ohos_uninit(struct ra_ctx *ctx)
@@ -75,12 +109,12 @@ static bool ohos_init(struct ra_ctx *ctx)
         goto fail;
     }
 
-    EGLConfig config;
-    if (!mpegl_create_context(ctx, p->egl_display, &p->egl_context, &config))
+    if (!mpegl_create_context(ctx, p->egl_display, &p->egl_context,
+                              &p->egl_config))
         goto fail;
 
     OHNativeWindow *native_window = vo_ohos_native_window(ctx->vo);
-    p->egl_surface = eglCreateWindowSurface(p->egl_display, config,
+    p->egl_surface = eglCreateWindowSurface(p->egl_display, p->egl_config,
                                     (EGLNativeWindowType)native_window, NULL);
 
     if (p->egl_surface == EGL_NO_SURFACE) {
@@ -128,6 +162,15 @@ static bool ohos_reconfig(struct ra_ctx *ctx)
 
 static int ohos_control(struct ra_ctx *ctx, int *events, int request, void *arg)
 {
+    switch (request) {
+    case VOCTRL_GET_DISPLAY_FPS: {
+        double fps = vo_ohos_display_fps(ctx->vo);
+        if (fps <= 0)
+            return VO_NOTIMPL;
+        *(double *)arg = fps;
+        return VO_TRUE;
+    }
+    }
     return VO_NOTIMPL;
 }
 
